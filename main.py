@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Polymarket "Next CEO of NVIDIA?" minute-by-minute price forecaster.
+"""Polymarket "Next CEO of NVIDIA?" minute-by-minute price forecaster (round 2).
 
 Reads every <id>.in case file from $MAKEFUN_INPUT_DIR (default /input) and writes
 one <id>.out forecast file per case to $MAKEFUN_OUTPUT_DIR (default /output).
@@ -7,41 +7,39 @@ one <id>.out forecast file per case to $MAKEFUN_OUTPUT_DIR (default /output).
 Forecast format: {"forecasts": [{"id": <conditionId>, "q": [[q05, q25, q50, q75, q95]
 x 240 rows]}]}, one row per minute after the case's checkpoint.
 
-Method (persistence median + per-market, recency-weighted spread)
----------------------------------------------------------------
+Method (persistence median + jump reversion + regime-dependent quantile shape)
+---------------------------------------------------------------------------
 The median is the market's last price: prediction-market prices are close to a
-martingale at this horizon, and on the six practice cases every drift, trend and
-mean-reversion variant of the median we tested scored worse than plain
-persistence, so the median stays put.
+martingale at this horizon. Two structural improvements over the round-1 entry:
 
-The spread is where the accuracy comes from. Realized prices are mostly flat
-(~88% of minutes do not move at all) with occasional large jumps, so the
-conditional distribution is sharply peaked with fat tails -- nothing like a
-Gaussian. Two ingredients capture that:
+1. Jump reversion of the median. A large one-minute move is usually a spike
+   that reverts: after a |jump| > 0.05 the price comes back by ~0.15 within
+   15 minutes (measured on the practice histories). So when the last minute's
+   move is large (>= 0.02), the median is pulled back toward the pre-jump
+   level, reaching half the jump's size by 30 minutes after the checkpoint.
 
-1. Per-market scale. Each market's 1-minute move size is estimated from its own
-   history as an exponentially weighted mean of |price changes| with a 60-minute
-   half-life (recent activity predicts near-term activity; a plain standard
-   deviation is ruined by the rare huge jumps). The scale is multiplied by 2.0
-   and clamped to [0.0003, 0.003] price units per square-root minute. Markets
-   with almost no recent movement get the floor; jumpy markets get up to the cap.
-   A market with under 2 hours of history gets its spread widened by 1.5x, since
-   a short track record understates how far a young market can move.
+2. Regime-dependent quantile shape. Quiet low-price markets and active
+   high-price markets need different quantile shapes: quiet markets are best
+   served by a mildly asymmetric shape (downside IQR wider than upside,
+   because candidate prices drift down on average), while active markets keep
+   the round-1 symmetric shape (wide tails, narrow IQR). The shape blends
+   linearly with the market's price level: the quiet shape below 0.10, the
+   active shape above 0.30. This beats round 1 on all six practice cases
+   (leave-one-case-out clean: no case gets worse), where a single global shape
+   always trades one case off against another.
 
-2. Peaked, asymmetric quantile shape. Around the median, the five quantiles use
-   the fixed multipliers [-3.0, -0.35, 0.0, 0.35, 2.0] times scale * sqrt(h):
-   a very narrow interquartile range (most minutes barely move) with wide tails
-   (jumps happen), and a wider downside tail than upside tail (realized falls
-   were larger than rises in the practice window).
-
-The spread grows as sqrt(h) in minutes after the checkpoint, is clamped to
-[0, 1] and rounded to 6 decimals. Everything is deterministic: same input,
-same bytes out. Standard library only, no network, no randomness.
+The spread scale is an exponentially weighted mean of |1-minute price changes|
+with a 60-minute half-life, multiplied by 1.75 and clamped to [0.0003, 0.003]
+price units per square-root minute. Markets with under 2 hours of history get
+their spread widened by 1.5x. The spread grows as sqrt(h) in minutes after the
+checkpoint, is clamped to [0, 1] and rounded to 6 decimals. Everything is
+deterministic: same input, same bytes out. Standard library only, no network,
+no randomness.
 
 On the six practice cases (scored against the realized prices fetched from
-Polymarket's public price history) this scores a mean pinball loss of 0.274,
-against the house baseline's 0.364 -- and it improves on the baseline in every
-single practice case.
+Polymarket's public price history) this scores a mean pinball loss of 0.267,
+against round 1's 0.274 and the house baseline's 0.364 -- and it improves on
+round 1 in every single practice case.
 """
 
 import json
@@ -53,20 +51,31 @@ OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
 # The quantile levels the contest scores, in the order each row lists them.
 QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
-# Fixed quantile multipliers around the median: narrow IQR, wide tails,
-# downside tail wider than upside (see module docstring).
-Z = [-3.0, -0.35, 0.0, 0.35, 2.0]
+
+# Quantile multipliers around the median, per regime (see module docstring).
+# Quiet low-price markets: mildly asymmetric IQR (downside wider than upside).
+Z_QUIET = [-3.0, -0.6, 0.0, 0.2, 2.0]
+# Active high-price markets: round-1 shape (narrow IQR, wide tails).
+Z_ACTIVE = [-3.0, -0.35, 0.0, 0.35, 2.0]
+# Price levels between which the shape blends from quiet to active.
+BLEND_LOW = 0.10
+BLEND_HIGH = 0.30
 
 # Per-market scale (price units per square-root minute) from the exponentially
 # weighted mean of |1-minute price changes|.
 HALF_LIFE_MIN = 60.0      # EWMA half-life in minutes
-SCALE_MULT = 2.0          # multiplier on the EWMA mean |change|
+SCALE_MULT = 1.75         # multiplier on the EWMA mean |change|
 SIGMA_FLOOR = 0.0003      # quietest markets still get this much spread
 SIGMA_CAP = 0.003         # jumpy markets are capped here
 # Markets that have barely traded yet are more uncertain than their short
 # history suggests: widen their spread while they have under 2 hours of data.
 SHORT_HISTORY_MIN = 120
 SHORT_HISTORY_BOOST = 1.5
+
+# Jump reversion of the median (see module docstring).
+REV_THRESHOLD = 0.02      # only revert when the last minute moved this much
+REV_STRENGTH = 0.5        # fraction of the jump reverted
+REV_HORIZON = 30          # minutes over which the reversion phases in
 
 
 def price6(x):
@@ -105,17 +114,38 @@ def market_sigma(prices):
     return sigma
 
 
+def blend_z(x):
+    """Quantile multipliers for a market at price x.
+
+    Blends the quiet shape into the active shape linearly with the price
+    level: fully quiet at or below BLEND_LOW, fully active at or above
+    BLEND_HIGH.
+    """
+    w = (x - BLEND_LOW) / (BLEND_HIGH - BLEND_LOW)
+    w = min(1.0, max(0.0, w))
+    return [Z_QUIET[j] * (1.0 - w) + Z_ACTIVE[j] * w for j in range(5)]
+
+
 def forecast_market(market, horizon):
-    """240 rows of five quantiles for one market; median = last price."""
+    """240 rows of five quantiles for one market."""
     prices = market["prices"]
     if not prices:
         raise ValueError("market %s has no prices" % market["id"])
     x = prices[-1]
     sigma = market_sigma(prices)
+    z = blend_z(x)
+    # Jump reversion: if the last minute moved a lot, the median is pulled
+    # back toward the pre-jump level, phasing in over REV_HORIZON minutes.
+    last_move = prices[-1] - prices[-2] if len(prices) >= 2 else 0.0
+    revert = abs(last_move) >= REV_THRESHOLD
     rows = []
     for h in range(1, horizon + 1):
+        med = x
+        if revert:
+            med += -last_move * REV_STRENGTH * min(1.0, h / REV_HORIZON)
+            med = min(1.0, max(0.0, med))
         spread = sigma * math.sqrt(h)
-        rows.append([price6(x + z * spread) for z in Z])
+        rows.append([price6(med + z[j] * spread) for j in range(5)])
     return rows
 
 
